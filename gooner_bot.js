@@ -1,5 +1,5 @@
 // ============================================================
-//  guardian_bot.js — Mineflayer Multi-Bot Controller
+//  gooner_bot.js — Mineflayer Multi-Bot Controller
 //  Annotated & cleaned for public release.
 //
 //  REQUIREMENTS:
@@ -7,7 +7,7 @@
 //    npm install mineflayer
 //
 //  USAGE:
-//    node guardian_bot.js
+//    node gooner_bot.js
 //    Then pick a mode: a (login cycler) or b (play controller)
 //
 //  See the COMMAND REFERENCE at the bottom of this file.
@@ -1883,7 +1883,7 @@ function startModeB(botCount, getUsername) {
 //       WEBHOOKS       →  list of Discord webhook URLs for bot logging
 //
 //  4. Run the script:
-//       node guardian_bot.js
+//       node gooner_bot.js
 //
 //  5. Choose a mode when prompted:
 //       a  →  Login cycler (sequentially logs each bot in and out)

@@ -1,4 +1,4 @@
-# Guardian Dashboard
+# Gooner
 
 Web dashboard for managing multiple Mineflayer Minecraft bots with real-time telemetry, movement control, animations, and remote command execution.
 
@@ -41,7 +41,7 @@ Edit `config.json`:
 | `bot_start` | Starting number suffix for bot usernames |
 | `webhooks` | Discord webhook URLs (round-robin per bot) |
 
-Hardcoded options in `guardian_bot.js`: server host, port, Minecraft version, bot prefix, login password.
+Hardcoded options in `gooner_bot.js`: server host, port, Minecraft version, bot prefix, login password.
 
 ## Modes
 
@@ -96,7 +96,7 @@ Facing: `in`, `out`, or `tangent` (default).
 
 ```
 ├── server.js          # Express + Socket.IO server, API routes, bot interception
-├── guardian_bot.js    # Mineflayer bot controller (all bot logic + commands)
+├── gooner_bot.js    # Mineflayer bot controller (all bot logic + commands)
 ├── config.json        # Runtime configuration
 ├── public/
 │   ├── index.html     # Web UI shell

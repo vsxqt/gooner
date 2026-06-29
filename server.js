@@ -43,12 +43,12 @@ mineflayer.createBot = function(opts) {
     return bot;
 };
 
-// We intercept console.log to stream logs to the frontend without modifying guardian_bot.js
+// We intercept console.log to stream logs to the frontend without modifying gooner_bot.js
 const origLog = console.log;
 console.log = function(...args) {
     const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
     
-    // Parse the specific format used by guardian_bot.js: "emoji [username] message"
+    // Parse the specific format used by gooner_bot.js: "emoji [username] message"
     const match = msg.match(/^([^\s]+) \[([^\]]+)\] (.*)$/);
     if (match) {
         const [full, emoji, botName, text] = match;
@@ -178,7 +178,7 @@ setInterval(() => {
 // ==========================================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`[Dashboard] Running on http://localhost:${PORT}`);
+    console.log(`[Gooner] Running on http://localhost:${PORT}`);
     // Load the original controller logic
-    require('./guardian_bot.js');
+    require('./gooner_bot.js');
 });

@@ -1,5 +1,5 @@
 {
-  "name": "guardian-dashboard",
+  "name": "gooner",
   "version": "1.0.0",
   "private": true,
   "description": "Web dashboard for managing multiple Mineflayer Minecraft bots with real-time telemetry, animations, and remote control",

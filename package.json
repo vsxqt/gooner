@@ -17,12 +17,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xlzxq-prithvi/gooner.git"
+    "url": "git+https://github.com/vsxqt/gooner.git"
   },
   "bugs": {
     "url": "https://github.com/xlzxq-prithvi/gooner/issues"
   },
-  "homepage": "https://github.com/xlzxq-prithvi/gooner#readme",
+  "homepage": "https://github.com/vsxqt/gooner#readme",
   "engines": {
     "node": ">=16"
   },

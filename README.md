@@ -66,7 +66,7 @@ Plain text entered in the terminal or web chat input is broadcast as in-game cha
 
 ### Movement
 
-`!forward [n]` `!back [n]` `!left [n]` `!right [n]` `!jump` `!sprint` `!sneak` `!shift [sec]` `!stop`
+`!front [n]` `!back [n]` `!left [n]` `!right [n]` `!jump` `!sprint` `!sneak` `!shift [sec]` `!stop`
 
 ### Animations
 
@@ -74,8 +74,8 @@ Plain text entered in the terminal or web chat input is broadcast as in-game cha
 |---|---|
 | `!orbit <cx> <cz> <r> [spd] [facing]` | Circle a coordinate |
 | `!forbit <user> <r> [spd] [facing]` | Orbit a player |
-| `!trick1 <cx> <cz> <r> [amp] [spd] [facing]` | Orbiting wave |
-| `!trick2 <cx> <cz> <r> [amp] [spd] [facing]` | Arm wave (fixed ring) |
+| `!donut <cx> <cz> <r> [amp] [spd] [facing]` | Orbiting wave |
+| `!airjump <cx> <cz> <r> [amp] [spd] [facing]` | Arm wave (fixed ring) |
 | `!wjump <cx> <cz> <r> [h] [spd] [facing]` | Jump wave |
 | `!star <cx> <cz> <outerR> [innerR] [spd] [facing]` | 5-pointed star path |
 | `!follow <user> [r] [spd]` | Track a player |
@@ -86,7 +86,7 @@ Facing: `in`, `out`, or `tangent` (default).
 
 ### Utility
 
-`!slot <1-9>` `!click left|right` `!lc` `!p` `!farm` `!gravity` `!spin [spd]` `!rotate` `!gui open|list|click|close` `!bw` `!all` `!near` `!chat` `!log`
+`!slot <1-9>` `!click left|right` `!lc` `!p` `!farm` `!gravity` `!spin [spd]` `!gui open|list|click|close` `!bw` `!tab` `!near` `!chat` `!log`
 
 ## BedWars auto-join
 

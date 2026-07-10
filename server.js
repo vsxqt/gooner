@@ -107,7 +107,7 @@ app.get('/api/status', (req, res) => {
         serverStatus: 'Online',
         onlineBots: activeBots.size,
         offlineBots: 0,
-        currentMode: JSON.parse(fs.readFileSync('./config.json', 'utf8')).mode.toUpperCase(),
+        currentMode: JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8')).mode.toUpperCase(),
         serverIp: 'eu.mineberry.net', // Extracted statically from your file
         mcVersion: '1.8',
         cpuUsage: process.cpuUsage().user / 1000000, // Simplified CPU metric
@@ -140,7 +140,7 @@ app.post('/api/chat', (req, res) => {
 
 app.post('/api/settings', (req, res) => {
     const newConfig = req.body;
-    fs.writeFileSync('./config.json', JSON.stringify(newConfig, null, 2));
+    fs.writeFileSync(path.join(__dirname, 'config.json'), JSON.stringify(newConfig, null, 2));
     res.json({ success: true, message: 'Settings saved. Restart backend to apply.' });
 });
 
@@ -175,6 +175,9 @@ setInterval(() => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`[Gooner] Running on http://localhost:${PORT}`);
+    // Auto-open browser
+    const startCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+    require('child_process').exec(`${startCmd} http://localhost:${PORT}`);
     // Load the original controller logic
     require('./gooner.js');
 });

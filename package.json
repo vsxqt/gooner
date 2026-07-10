@@ -29,7 +29,14 @@
   "dependencies": {
     "chart.js": "^4.5.1",
     "express": "^4.22.2",
+    "http-proxy-agent": "^9.1.0",
     "mineflayer": "^4.37.1",
-    "socket.io": "^4.8.3"
+    "mineflayer-collectblock": "^1.6.0",
+    "mineflayer-mouse": "^0.1.28",
+    "mineflayer-pathfinder": "^2.4.5",
+    "mineflayer-statemachine": "^1.7.0",
+    "mineflayer-tool": "^1.2.0",
+    "socket.io": "^4.8.3",
+    "socks-proxy-agent": "^10.1.0"
   }
 }

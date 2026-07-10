@@ -10,12 +10,26 @@
 //    node gooner.js
 //    Then pick a mode: a (login cycler) or b (play controller)
 //
-//  See the COMMAND REFERENCE at the bottom of this file.
+//  Commands: !cmd [args] | !bot <N> cmd [args] | plain text = chat
 // ============================================================
 
 const mineflayer = require('mineflayer'); // Main Minecraft bot library
 const readline   = require('readline');   // For reading terminal input
 const https      = require('https');      // For sending Discord webhook messages
+const net        = require('net');        // For raw TCP connections (HTTP CONNECT proxy)
+
+// Suppress prismarine-chunk ERR_OUT_OF_RANGE noise from 1.8 chunk parsing
+process.on('uncaughtException', function(err) {
+  if (err && err.code === 'ERR_OUT_OF_RANGE' && err.message.indexOf('sourceStart') !== -1) return;
+  console.error('[UNCAUGHT]', err);
+});
+
+// Intercept all 'error' events on ALL EventEmitters to catch ERR_OUT_OF_RANGE
+var __origEmit = require('events').EventEmitter.prototype.emit;
+require('events').EventEmitter.prototype.emit = function(type) {
+  if (type === 'error' && arguments[1] && arguments[1].code === 'ERR_OUT_OF_RANGE') return true;
+  return __origEmit.apply(this, arguments);
+};
 
 // ────────────────────────────────────────────────────────────
 //  SHARED CONFIG — edit these to match your server & bots
@@ -36,7 +50,7 @@ const LOGIN_PASSWORD = 'your_password';   // ← /login password sent after join
 //  MODE B CONFIG — play controller
 // ────────────────────────────────────────────────────────────
 
-const BOT_COUNT = 1;   // How many bots to spawn (numbered sequentially)
+const BOT_COUNT = 4;   // How many bots to spawn (numbered sequentially)
 const BOT_START = 1;   // Starting number suffix for bot usernames
 
 // ────────────────────────────────────────────────────────────
@@ -63,6 +77,144 @@ const WEBHOOKS = [
 // Returns the webhook URL for a given bot index (round-robin)
 function webhookFor(index) { return WEBHOOKS[index % WEBHOOKS.length]; }
 
+// ────────────────────────────────────────────────────────────
+//  PROXY SUPPORT
+// ────────────────────────────────────────────────────────────
+const PROXY_FILE = __dirname + '/proxy.txt';
+
+// Reads proxy.txt (one URL per line, skips empty lines) and returns an array.
+// Accepted schemes: socks5://, socks4://, http://
+// Also auto-detects webshare format (host:port:user:pass → http://)
+var cachedProxies = null;
+function loadProxies() {
+  if (cachedProxies) return cachedProxies;
+  try {
+    var text = require('fs').readFileSync(PROXY_FILE, 'utf8');
+    var lines = text.split('\n');
+    cachedProxies = [];
+    for (var pi = 0; pi < lines.length; pi++) {
+      var line = lines[pi].trim();
+      if (line && line !== '') {
+        // Auto-detect webshare format: host:port:user:pass (no protocol, 4 colon-separated parts)
+        var parts = line.split(':');
+        if (parts.length === 4 && line.indexOf('://') === -1) {
+          line = 'http://' + parts[2] + ':' + parts[3] + '@' + parts[0] + ':' + parts[1];
+        }
+        cachedProxies.push(line);
+      }
+    }
+    console.log('[PROXY] Loaded ' + cachedProxies.length + ' proxies from proxy.txt');
+  } catch(e) {
+    console.log('[PROXY] proxy.txt not found — running without proxies');
+    cachedProxies = [];
+  }
+  return cachedProxies;
+}
+
+// Agent cache — reuse agents so we don't create new connections for each bot
+var proxyAgentCache = {};
+
+function makeProxyConnect(botIndex, proxies, botsPerProxy, fixed) {
+  if (fixed) {
+    var fixedUrl = proxies[botIndex % proxies.length];
+    var fixedUsed = false;
+    return function connectFixed(client) {
+      if (fixedUsed) return;
+      fixedUsed = true;
+      doConnect(client, fixedUrl, function() {
+        client.emit('error', new Error('Proxy ' + fixedUrl + ' failed'));
+      });
+    };
+  }
+  var attempt = 0;
+  return function connectWithRetry(client) {
+    if (attempt >= proxies.length) {
+      client.emit('error', new Error('All proxies failed for bot ' + botIndex));
+      return;
+    }
+    var proxyUrl = proxies[Math.floor((botIndex + attempt) / botsPerProxy) % proxies.length];
+    attempt++;
+    doConnect(client, proxyUrl, function() { connectWithRetry(client); });
+  };
+}
+
+function doConnect(client, proxyUrl, onFail) {
+  var cached = proxyAgentCache[proxyUrl];
+  if (cached && cached !== 'pending') {
+    client.setSocket(cached);
+    client.emit('connect');
+    return;
+  } else if (cached === 'pending') {
+    onFail();
+    return;
+  }
+
+  var isSocks = proxyUrl.indexOf('socks5://') === 0 || proxyUrl.indexOf('socks4://') === 0 || proxyUrl.indexOf('socks://') === 0;
+  var isHttp = proxyUrl.indexOf('http://') === 0 || proxyUrl.indexOf('https://') === 0;
+
+  if (!isSocks && !isHttp) { onFail(); return; }
+
+  proxyAgentCache[proxyUrl] = 'pending';
+
+  if (isSocks) {
+    var parts = proxyUrl.replace(/^socks(5|4)?:\/\//, '').split('@');
+    var auth = parts.length > 1 ? { userId: parts[0].split(':')[0], password: parts[0].split(':')[1] } : undefined;
+    var hp = (parts.length > 1 ? parts[1] : parts[0]).split(':');
+    var proxyOpts = {
+      proxy: {
+        host: hp[0], port: parseInt(hp[1]), type: proxyUrl.indexOf('socks4') === 0 ? 4 : 5
+      },
+      command: 'connect',
+      destination: { host: SERVER_HOST, port: SERVER_PORT },
+      timeout: 15000
+    };
+    if (auth && auth.userId) proxyOpts.proxy.userId = auth.userId;
+    if (auth && auth.password) proxyOpts.proxy.password = auth.password;
+
+    var { SocksClient } = require('socks');
+    SocksClient.createConnection(proxyOpts).then(function(r) {
+      proxyAgentCache[proxyUrl] = r.socket;
+      client.setSocket(r.socket);
+      client.emit('connect');
+    }).catch(function(err) {
+      delete proxyAgentCache[proxyUrl];
+      onFail();
+    });
+  } else if (isHttp) {
+    var purl = new URL(proxyUrl);
+    var s = net.connect(purl.port || 3128, purl.hostname, function() {
+      var req = 'CONNECT ' + SERVER_HOST + ':' + SERVER_PORT + ' HTTP/1.1\r\nHost: ' + SERVER_HOST + ':' + SERVER_PORT + '\r\n';
+      if (purl.username && purl.password) {
+        req += 'Proxy-Authorization: Basic ' + Buffer.from(purl.username + ':' + purl.password).toString('base64') + '\r\n';
+      }
+      req += '\r\n';
+      s.write(req);
+    });
+    var timeout = setTimeout(function() {
+      s.destroy();
+      delete proxyAgentCache[proxyUrl];
+      onFail();
+    }, 10000);
+    s.once('data', function(data) {
+      clearTimeout(timeout);
+      if (data.toString().indexOf('200') !== -1) {
+        proxyAgentCache[proxyUrl] = s;
+        client.setSocket(s);
+        client.emit('connect');
+      } else {
+        s.destroy();
+        delete proxyAgentCache[proxyUrl];
+        onFail();
+      }
+    });
+    s.on('error', function(err) {
+      clearTimeout(timeout);
+      delete proxyAgentCache[proxyUrl];
+      onFail();
+    });
+  }
+}
+
 
 // ============================================================
 //  MODE SELECT — prompts user on startup
@@ -72,18 +224,30 @@ function webhookFor(index) { return WEBHOOKS[index % WEBHOOKS.length]; }
 var rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
 console.log('\nSelect mode:');
-console.log('  a — Login cycler  (' + BOT_PREFIX + BOT_START + ' to ' + (BOT_START + BOT_COUNT - 1) + ', sends /login ' + LOGIN_PASSWORD + ')');
-console.log('  b — Play controller (' + BOT_PREFIX + BOT_START + ' to ' + (BOT_START + BOT_COUNT - 1) + ', full command system)');
-console.log('  c — Custom usernames (' + MODE_C_USERNAMES.length + ' bots from MODE_C_USERNAMES list, full command system)');
-process.stdout.write('\nMode (a/b/c): ');
+console.log('  a      — Login cycler  (' + BOT_PREFIX + BOT_START + ' to ' + (BOT_START + BOT_COUNT - 1) + ', sends /login ' + LOGIN_PASSWORD + ')');
+console.log('  ap<N>  — Login cycler with proxies (N bots per proxy)');
+console.log('  b      — Play controller (' + BOT_PREFIX + BOT_START + ' to ' + (BOT_START + BOT_COUNT - 1) + ', full command system)');
+console.log('  bp<N>  — Play controller with proxies (N bots per proxy)');
+console.log('  c      — Custom usernames (' + MODE_C_USERNAMES.length + ' bots from MODE_C_USERNAMES list, full command system)');
+console.log('  cp<N>  — Custom usernames with proxies (N bots per proxy)');
+process.stdout.write('\nMode (a/ap<N>/b/bp<N>/c/cp<N>): ');
 
 rl.once('line', function(answer) {
   var mode = answer.trim().toLowerCase();
-  if      (mode === 'a') { startModeA(); }
-  else if (mode === 'b') { startModeB(BOT_COUNT, function(i) { return BOT_PREFIX + (BOT_START + i); }); }
-  else if (mode === 'c') { startModeB(MODE_C_USERNAMES.length, function(i) { return MODE_C_USERNAMES[i]; }); }
+  var proxyMatch;
+  function botsPerProxyFrom(m) {
+    var match = m.match(/^[abc]p(\d+)$/);
+    return (match && parseInt(match[1], 10) >= 1) ? parseInt(match[1], 10) : 0;
+  }
+  var bpp = botsPerProxyFrom(mode);
+  if      (mode === 'a')                                    { startModeA(); }
+  else if (mode === 'ap' || (bpp && mode[0] === 'a'))       { startModeAWithProxies(bpp || 3); }
+  else if (mode === 'b')                                     { startModeB(BOT_COUNT, function(i) { return BOT_PREFIX + (BOT_START + i); }); }
+  else if (mode === 'bp' || (bpp && mode[0] === 'b'))       { startModeBWithProxies(BOT_COUNT, function(i) { return BOT_PREFIX + (BOT_START + i); }, bpp || 3); }
+  else if (mode === 'c')                                     { startModeB(MODE_C_USERNAMES.length, function(i) { return MODE_C_USERNAMES[i]; }); }
+  else if (mode === 'cp' || (bpp && mode[0] === 'c'))       { startModeBWithProxies(MODE_C_USERNAMES.length, function(i) { return MODE_C_USERNAMES[i]; }, bpp || 3, true); }
   else {
-    console.log('Unknown mode. Enter a, b, or c.');
+    console.log('Unknown mode. Enter a, ap<N>, b, bp<N>, c, or cp<N>.');
     process.exit(1);
   }
 });
@@ -95,8 +259,14 @@ rl.once('line', function(answer) {
 //  and moves on to the next bot in the sequence.
 // ============================================================
 
-function startModeA() {
-  console.log('\n[MODE A] Login cycler started. Bots ' + BOT_START + '-' + (BOT_START + BOT_COUNT - 1));
+function startModeA(proxies, botsPerProxy) {
+  var useProxies = proxies && proxies.length > 0;
+  var modeTag    = useProxies ? '[AP]' : '[A]';
+  if (useProxies) {
+    console.log('\n' + modeTag + ' Login cycler with proxies (' + botsPerProxy + ' bot(s) per proxy, ' + proxies.length + ' proxies loaded). Bots ' + BOT_START + '-' + (BOT_START + BOT_COUNT - 1));
+  } else {
+    console.log('\n' + modeTag + ' Login cycler started. Bots ' + BOT_START + '-' + (BOT_START + BOT_COUNT - 1));
+  }
 
   var currentIndex = BOT_START;  // Which bot number we're currently connecting
   var stopped      = false;      // Paused flag (e.g. when antibot is detected)
@@ -111,27 +281,33 @@ function startModeA() {
 
     // All bots have been processed — exit cleanly
     if (currentIndex > BOT_START + BOT_COUNT - 1) {
-      console.log('[A] All accounts cycled. Done.');
+      console.log(modeTag + ' All accounts cycled. Done.');
       process.exit(0);
       return;
     }
 
     var username = BOT_PREFIX + currentIndex;
+    var botSeqIndex = currentIndex - BOT_START;
     currentIndex++;
 
-    console.log('[A] Connecting: ' + username);
+    console.log(modeTag + ' Connecting: ' + username + (useProxies ? ' via proxy' : ''));
 
     // Create the Mineflayer bot in offline (cracked) mode
-    var bot = mineflayer.createBot({
+    var botOpts = {
       host: SERVER_HOST, port: SERVER_PORT,
       username: username, version: MC_VERSION, auth: 'offline',
-    });
+    };
+    if (useProxies) {
+      botOpts.connect = makeProxyConnect(botSeqIndex, proxies, botsPerProxy);
+      console.log(modeTag + ' ' + username + ' using proxy');
+    }
+    var bot = mineflayer.createBot(botOpts);
     currentBot = bot;
     var loggedIn = false; // Tracks whether /login has been sent and bot is ready to disconnect
 
     // Fired when the bot successfully joins the server
     bot.on('login', function() {
-      console.log('[A] ' + username + ' logged in, sending /login in 1s...');
+      console.log(modeTag + ' ' + username + ' logged in, sending /login in 1s...');
       setTimeout(function() {
         if (stopped) return;
         bot.chat('/login ' + LOGIN_PASSWORD);
@@ -156,12 +332,22 @@ function startModeA() {
       if (/^\[\w[^\]]*\]\s*\w+\s*:/.test(text)) return;
       if (/^</.test(text)) return;
 
-      console.log('[A] ' + username + ' SYS: ' + text);
+      // Condense antibot messages to just the verification URL
+      if (/antibot/i.test(text) || /confirm.*not.*robot/i.test(text)) {
+        var urlMatch = text.match(/(https?:\/\/[^\s]+)/);
+        if (urlMatch) {
+          console.log(modeTag + ' ' + username + ' 🔗 ' + urlMatch[1]);
+        } else {
+          console.log(modeTag + ' ' + username + ' SYS: ' + text);
+        }
+      } else {
+        console.log(modeTag + ' ' + username + ' SYS: ' + text);
+      }
 
       // If "antibot" appears in any server message, pause and wait for user input
       if (/antibot/i.test(text)) {
         console.log('\n[!!! ANTIBOT DETECTED !!!] "' + text + '"');
-        console.log('[A] Bot paused. Press ENTER to continue to next bot, or Ctrl+C to quit.');
+        console.log(modeTag + ' Bot paused. Press ENTER to continue to next bot, or Ctrl+C to quit.');
         stopped = true;
         if (currentBot) { try { currentBot.quit(); } catch(_) {} }
         process.stdin.resume();
@@ -178,17 +364,17 @@ function startModeA() {
     bot.on('error', function(e) {
       var m = (e && e.message) || '';
       if (/timed out|ECONNRESET|socketClosed|EPIPE/.test(m)) return;
-      console.log('[A] ' + username + ' error: ' + m);
+      console.log(modeTag + ' ' + username + ' error: ' + m);
     });
 
     // Log kick reasons and check for antibot kicks
     bot.on('kicked', function(reason) {
       var r = typeof reason === 'object' ? JSON.stringify(reason) : String(reason);
-      console.log('[A] ' + username + ' kicked: ' + r);
+      console.log(modeTag + ' ' + username + ' kicked: ' + r);
 
       if (/antibot/i.test(r)) {
         console.log('\n[!!! ANTIBOT DETECTED via KICK !!!] "' + r + '"');
-        console.log('[A] Bot paused. Press ENTER to continue to next bot, or Ctrl+C to quit.');
+        console.log(modeTag + ' Bot paused. Press ENTER to continue to next bot, or Ctrl+C to quit.');
         stopped = true;
         process.stdin.resume();
         process.stdin.once('data', function() {
@@ -201,7 +387,7 @@ function startModeA() {
 
     // When this bot disconnects, wait a moment then connect the next one
     bot.on('end', function(reason) {
-      console.log('[A] ' + username + ' disconnected: ' + reason);
+      console.log(modeTag + ' ' + username + ' disconnected: ' + reason);
       if (currentBot === bot) currentBot = null;
       if (loggedIn && !stopped) {
         var delay = rnd(2000, 3000);
@@ -211,6 +397,34 @@ function startModeA() {
   }
 
   connectNext(); // Kick off the first connection
+}
+
+
+// ── Proxy mode entry point ─────────────────────────────────
+// Called when the user enters ap<N>. Loads proxy.txt, then
+// delegates to startModeA with the proxy array and bots-per-proxy.
+function startModeAWithProxies(botsPerProxy) {
+  var proxies = loadProxies();
+  if (proxies.length === 0) {
+    console.log('[AP] No proxies loaded. Falling back to direct connection (mode A).');
+    startModeA();
+    return;
+  }
+  startModeA(proxies, botsPerProxy);
+}
+
+
+// ── Proxy mode entry point for B/C ─────────────────────────
+// Called when the user enters bp<N> or cp<N>.
+// fixedProxies=true means each bot gets one permanent proxy (no round-robin failover).
+function startModeBWithProxies(botCount, getUsername, botsPerProxy, fixedProxies) {
+  var proxies = loadProxies();
+  if (proxies.length === 0) {
+    console.log('[PROXY] No proxies loaded. Falling back to direct connection.');
+    startModeB(botCount, getUsername);
+    return;
+  }
+  startModeB(botCount, getUsername, proxies, botsPerProxy, fixedProxies);
 }
 
 
@@ -226,9 +440,14 @@ function startModeA() {
 //                Mode C: index → MODE_C_USERNAMES[index]
 // ============================================================
 
-function startModeB(botCount, getUsername) {
+function startModeB(botCount, getUsername, proxies, botsPerProxy, fixedProxies) {
+  var useProxies = proxies && proxies.length > 0;
   var modeName = (getUsername(0) === BOT_PREFIX + BOT_START) ? 'B' : 'C';
-  console.log('\n[MODE ' + modeName + '] Play controller started. ' + botCount + ' bot(s).');
+  if (useProxies) {
+    console.log('\n[MODE ' + modeName + 'P] Play controller with proxies (' + botsPerProxy + ' bot(s) per proxy, ' + proxies.length + ' proxies). ' + botCount + ' bot(s).');
+  } else {
+    console.log('\n[MODE ' + modeName + '] Play controller started. ' + botCount + ' bot(s).');
+  }
 
   // ── Discord webhook sender ───────────────────────────────
   // Queues messages per-bot to avoid rate limits (one message every 5s per bot)
@@ -264,6 +483,8 @@ function startModeB(botCount, getUsername) {
   var lastLog     = {};      // Last logged message per bot (prevents same-message spam)
   var globalDedup = {};      // Global dedup for broadcast messages (📢)
   var loggingOn   = true;    // Can be toggled with !log command
+  var fatihs    = { 'whitehawk': true, 'maxver': true };
+  var partyCmdDedup = {};   // Prevents duplicate #-command execution across bots
 
   function lg(u, emoji, msg) {
     if (!loggingOn) return;
@@ -331,9 +552,9 @@ function startModeB(botCount, getUsername) {
 
   // Shared wave clocks — three floats advanced once per master tick.
   // No separate setInterval per feature; the master tick owns them all.
-  var waveClocks = { t1: 0, t2: 0, wj: 0 };
-  var waveSpeed  = { t1: 0.05, t2: 0.05, wj: 0.08 }; // updated when a feature starts
-  var waveActive = { t1: 0,    t2: 0,    wj: 0    };  // how many bots use each wave
+  var waveClocks = { donut: 0, airjump: 0, wj: 0 };
+  var waveSpeed  = { donut: 0.05, airjump: 0.05, wj: 0.08 };
+  var waveActive = { donut: 0,    airjump: 0,    wj: 0    };
 
   // ── Bot spawner ──────────────────────────────────────────
   // Creates a single bot, registers all event listeners,
@@ -344,13 +565,17 @@ function startModeB(botCount, getUsername) {
 
     lg(username, '🔄', 'Connecting...');
 
-    var bot = mineflayer.createBot({
+    var botOpts = {
       username: username, version: MC_VERSION, auth: 'offline',
       host: SERVER_HOST, port: SERVER_PORT,
       viewDistance: 'tiny',          // Reduce chunk load for performance
       physicsEnabled: true,          // Required for movement commands
       checkTimeoutInterval: 60000,   // Ping timeout (ms)
-    });
+    };
+    if (useProxies) {
+      botOpts.connect = makeProxyConnect(index, proxies, botsPerProxy, fixedProxies);
+    }
+    var bot = mineflayer.createBot(botOpts);
 
     bots.set(username, bot);
     botList[index] = bot;
@@ -378,11 +603,36 @@ function startModeB(botCount, getUsername) {
       if (/^</.test(text)) return;
       if (/kitpvp/i.test(text)) return;
 
+      // Condense antibot messages to just the verification URL
+      if (/antibot/i.test(text) || /confirm.*not.*robot/i.test(text)) {
+        var urlMatch = text.match(/(https?:\/\/[^\s]+)/);
+        if (urlMatch) {
+          lg(username, '🔗', urlMatch[1]);
+          sendToDiscord(webhook, username, urlMatch[1]);
+          return;
+        }
+      }
+
+      // ── Party chat command handling (# prefix from fatihs) ──
+      var partyMatch = text.match(/^Party\s+\S+\s+(\S+)\s*:\s*(.*)/);
+      if (partyMatch) {
+        var sender = partyMatch[1].toLowerCase();
+        var pMsg   = partyMatch[2];
+        if (pMsg[0] === '#' && fatihs[sender]) {
+          var dedupKey = sender + ':' + pMsg;
+          if (partyCmdDedup[dedupKey]) return;
+          partyCmdDedup[dedupKey] = true;
+          setTimeout(function() { delete partyCmdDedup[dedupKey]; }, 2000);
+          processInput(pMsg.slice(1));
+          return;
+        }
+      }
+
       lg(username, '📢', text);
       sendToDiscord(webhook, username, text);
     });
 
-    // ── Player tracking for !all / !near / !<name> ──
+    // ── Player tracking for !tab / !near / !<name> ──
     bot._entityMap = Object.create(null);
     bot._lastPos = Object.create(null);
     bot._chatLogging = false;
@@ -456,11 +706,7 @@ function startModeB(botCount, getUsername) {
 
       var st = botState[index];
       if (st.shiftTimer) { clearTimeout(st.shiftTimer); st.shiftTimer = null; }
-      // Decrement wave-active counts before clearing anim
-      if (st.anim === 'trick1') waveActive.t1 = Math.max(0, (waveActive.t1 || 0) - 1);
-      if (st.anim === 'trick2') waveActive.t2 = Math.max(0, (waveActive.t2 || 0) - 1);
-      if (st.anim === 'wjump')  waveActive.wj = Math.max(0, (waveActive.wj || 0) - 1);
-      st.anim    = null;
+      clearAnim(st, bot);
       st.pTick   = 0;
       st.farmTick= 0;
       st.farming = false;
@@ -468,7 +714,6 @@ function startModeB(botCount, getUsername) {
       st.follow.active = false;
       st.snake.active = false;
       removeForbitGroup(index);
-      try { bot.physicsEnabled = true; } catch(_) {}
 
       setTimeout(function() { spawnBot(index); }, 10000 + index * 500);
     });
@@ -486,8 +731,8 @@ function startModeB(botCount, getUsername) {
   // we skip instantly.  Wave clocks are floats — advancing them costs nothing.
   setInterval(function() {
     // Advance shared wave clocks once per tick
-    waveClocks.t1 += waveSpeed.t1;
-    waveClocks.t2 += waveSpeed.t2;
+    waveClocks.donut += waveSpeed.donut;
+    waveClocks.airjump += waveSpeed.airjump;
     waveClocks.wj += waveSpeed.wj;
 
     for (var _mi = 0; _mi < botCount; _mi++) {
@@ -630,12 +875,6 @@ function startModeB(botCount, getUsername) {
       // ── animations ─────────────────────────────────────────
       if (!_a) continue;
 
-      if (_a === 'rotate') {
-        _st.rotYaw += _st.rotSpeed;
-        try { _bot.look(_st.rotYaw, 0, false); } catch(_) {}
-        continue;
-      }
-
       if (_a === 'spin') {
         _st.spinYaw = (_st.spinYaw || 0) + (_st.spinSpeed || 0.15);
         try { _bot.look(_st.spinYaw, 0, false); } catch(_) {}
@@ -708,24 +947,24 @@ function startModeB(botCount, getUsername) {
         continue;
       }
 
-      if (_a === 'trick1') {
+      if (_a === 'donut') {
         _st.angle += _st.speed;
         tx = _st.cx + _st.radius * Math.cos(_st.angle);
         tz = _st.cz + _st.radius * Math.sin(_st.angle);
-        ty = _st.baseY + _st.amp * Math.sin(waveClocks.t1 + _st.wavePhase);
+        ty = _st.baseY + _st.amp * Math.sin(waveClocks.donut + _st.wavePhase);
         yaw = _st.faceIn  ? Math.atan2(_st.cz - tz, _st.cx - tx)
             : _st.faceOut ? Math.atan2(tz - _st.cz, tx - _st.cx)
             :               -(_st.angle + 1.5707963);
         try { _pos.x = tx; _pos.z = tz; _pos.y = ty; _vel.x = 0; _vel.y = 0; _vel.z = 0; } catch(_) { continue; }
-        pitch = Math.atan2(_st.amp * _st.speed * Math.cos(waveClocks.t1 + _st.wavePhase), _st.speed * _st.radius);
+        pitch = Math.atan2(_st.amp * _st.speed * Math.cos(waveClocks.donut + _st.wavePhase), _st.speed * _st.radius);
         try { _bot.look(yaw, -pitch, false); } catch(_) {}
         continue;
       }
 
-      if (_a === 'trick2') {
+      if (_a === 'airjump') {
         // tx/tz are constant — pre-stored; only Y changes
-        ty = _st.baseY + _st.amp * Math.sin(_st.ringAngle - waveClocks.t2);
-        pitch = Math.atan2(_st.amp * waveSpeed.t2 * Math.cos(_st.ringAngle - waveClocks.t2), 1);
+        ty = _st.baseY + _st.amp * Math.sin(_st.ringAngle - waveClocks.airjump);
+        pitch = Math.atan2(_st.amp * waveSpeed.airjump * Math.cos(_st.ringAngle - waveClocks.airjump), 1);
         try { _pos.x = _st.tx; _pos.z = _st.tz; _pos.y = ty; _vel.x = 0; _vel.y = 0; _vel.z = 0; } catch(_) { continue; }
         try { _bot.look(_st.yaw, -pitch, false); } catch(_) {}
         continue;
@@ -756,12 +995,17 @@ function startModeB(botCount, getUsername) {
         try { _bot.look(yaw, 0, false); } catch(_) {}
         continue;
       }
+
+      // If physics is disabled and no animation is active, prevent velocity buildup
+      if (!_bot.physicsEnabled && !_a) {
+        _vel.x = 0; _vel.y = 0; _vel.z = 0;
+      }
     }
   }, 50);
 
 
   // ── Movement helpers ─────────────────────────────────────
-  var MOVE_KEYS = ['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint'];
+  var MOVE_KEYS = ['front', 'back', 'left', 'right', 'jump', 'sneak', 'sprint'];
   function stopAll(bot) {
     for (var k = 0; k < MOVE_KEYS.length; k++) {
       try { bot.setControlState(MOVE_KEYS[k], false); } catch(_) {}
@@ -772,6 +1016,31 @@ function startModeB(botCount, getUsername) {
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
     stopAll(bot);
     var start = bot.entity.position.clone();
+
+    // Physics disabled — walk by directly manipulating position (air-walk)
+    if (!bot.physicsEnabled) {
+      var yaw = bot.entity.yaw;
+      var dx, dz;
+      if (dir === 'front')  { dx = -Math.sin(yaw); dz = -Math.cos(yaw); }
+      else if (dir === 'back')   { dx = Math.sin(yaw);  dz = Math.cos(yaw); }
+      else if (dir === 'left')   { dx = Math.cos(yaw);  dz = -Math.sin(yaw); }
+      else if (dir === 'right')  { dx = -Math.cos(yaw); dz = Math.sin(yaw); }
+      else { lg(username, '❌', 'unsupported dir without physics'); return; }
+      var step = 0.2;
+      lg(username, '🚶', dir + ' x' + blocks + ' (air-walk)');
+      var iv = setInterval(function() {
+        if (!bot.entity) { clearInterval(iv); return; }
+        var p = bot.entity.position;
+        var dist = Math.sqrt((p.x - start.x) * (p.x - start.x) + (p.z - start.z) * (p.z - start.z));
+        if (dist >= blocks) { clearInterval(iv); stopAll(bot); lg(username, '✅', 'Done ' + dir); return; }
+        p.x += dx * step;
+        p.z += dz * step;
+        bot.entity.velocity.x = 0;
+        bot.entity.velocity.z = 0;
+      }, 50);
+      return;
+    }
+
     try { bot.setControlState(dir, true); } catch(e) { lg(username, '❌', e.message); return; }
     lg(username, '🚶', dir + ' x' + blocks);
     // walkBlocks keeps its own interval — it's a one-shot, not a sustained animation
@@ -794,26 +1063,11 @@ function startModeB(botCount, getUsername) {
 
 
   // ── Rotate ───────────────────────────────────────────────
-  function startRotate(bot, username, index, stop) {
-    var st = botState[index];
-    if (st.anim === 'rotate' || stop) {
-      st.anim = null;
-      lg(username, '⏹️', 'rotate stopped');
-      return;
-    }
-    st.anim     = 'rotate';
-    st.rotYaw   = 0;
-    st.rotSpeed = 0.15 + (index % 20) * 0.005;
-    lg(username, '🔄', 'spinning');
-  }
-
   function doSpin(bot, username, index, stop, speed) {
     var st = botState[index];
-    if (st.anim === 'spin' || stop) {
-      st.anim = null;
-      lg(username, '⏹️', 'spin stopped');
-      return;
-    }
+    if (st.anim === 'spin') { clearAnim(st, bot); lg(username, '⏹️', 'spin stopped'); return; }
+    if (stop) { clearAnim(st, bot); lg(username, '⏹️', 'spin stopped'); return; }
+    clearAnim(st, bot);
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
     st.anim     = 'spin';
     st.spinYaw  = 0;
@@ -889,7 +1143,8 @@ function startModeB(botCount, getUsername) {
 
   function doOrbit(bot, username, index, stop, cx, cz, radius, speed, phaseOffset, facing) {
     var st = botState[index];
-    if (stop) { st.anim = null; restorePhysics(bot); lg(username, '⏹️', 'orbit stopped'); return; }
+    if (stop) { clearAnim(st, bot); lg(username, '⏹️', 'orbit stopped'); return; }
+    clearAnim(st, bot);
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
     if (isNaN(cx) || isNaN(cz) || isNaN(radius) || radius <= 0) { lg(username, '❌', 'orbit <cx> <cz> <radius> [speed] [in|out|tangent]'); return; }
     var spd = (speed > 0 && !isNaN(speed)) ? speed : 0.05;
@@ -908,9 +1163,10 @@ function startModeB(botCount, getUsername) {
     var st = botState[index];
     if (stop) {
       removeForbitGroup(index);
-      st.anim = null; restorePhysics(bot); lg(username, '⏹️', 'forbit stopped');
+      clearAnim(st, bot); lg(username, '⏹️', 'forbit stopped');
       return;
     }
+    clearAnim(st, bot);
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
     if (!targetUser || isNaN(radius) || radius <= 0) { lg(username, '❌', 'forbit <user> <radius> [speed] [in|out|tangent]'); return; }
     var spd = (speed > 0 && !isNaN(speed)) ? speed : 0.005;
@@ -927,11 +1183,12 @@ function startModeB(botCount, getUsername) {
   }
 
 
-  function doGravity(bot, username, on) {
+  function doPhy(bot, username, on) {
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
-    if (on === undefined) on = (bot.physicsEnabled !== false);
-    try { bot.physicsEnabled = !on; bot.entity.velocity.x = 0; bot.entity.velocity.y = 0; bot.entity.velocity.z = 0; } catch(e) { lg(username, '❌', e.message); return; }
-    lg(username, on ? '🪂' : '🌍', 'antigravity ' + (on ? 'ON' : 'OFF'));
+    if (on === undefined) on = !bot.physicsEnabled;
+    else                  on = (on === 'on');
+    try { bot.physicsEnabled = on; bot.entity.velocity.x = 0; bot.entity.velocity.y = 0; bot.entity.velocity.z = 0; } catch(e) { lg(username, '❌', e.message); return; }
+    lg(username, on ? '🌍' : '🪂', 'physics ' + (on ? 'ON' : 'OFF'));
   }
 
   function freezePhysics(bot) {
@@ -941,10 +1198,19 @@ function startModeB(botCount, getUsername) {
     try { bot.physicsEnabled = true; } catch(_) {}
   }
 
+  function clearAnim(st, bot) {
+    if (!st.anim) return;
+    if (st.anim === 'donut') waveActive.donut = Math.max(0, waveActive.donut - 1);
+    else if (st.anim === 'airjump') waveActive.airjump = Math.max(0, waveActive.airjump - 1);
+    else if (st.anim === 'wjump') waveActive.wj = Math.max(0, waveActive.wj - 1);
+    if (st.anim !== 'spin') restorePhysics(bot);
+    st.anim = null;
+  }
+
 
   function doFly(bot, username, index, dir, blocks, speed) {
     var st = botState[index];
-    if (dir === 'stop') { st.anim = null; restorePhysics(bot); lg(username, '⏹️', 'fly stopped'); return; }
+    if (dir === 'stop') { clearAnim(st, bot); lg(username, '⏹️', 'fly stopped'); return; }
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
     if (dir !== 'up' && dir !== 'down') { lg(username, '❌', 'fly up|down <blocks> [speed]'); return; }
     if (isNaN(blocks) || blocks <= 0)   { lg(username, '❌', 'fly: blocks must be > 0'); return; }
@@ -959,17 +1225,16 @@ function startModeB(botCount, getUsername) {
   }
 
 
-  function doTrick1(bot, username, index, stop, cx, cz, radius, amplitude, speed, phaseOffset, facing) {
+  function doDonut(bot, username, index, stop, cx, cz, radius, amplitude, speed, phaseOffset, facing) {
     var st = botState[index];
-    if (st.anim === 'trick1') { waveActive.t1 = Math.max(0, waveActive.t1 - 1); }
-    st.anim = null;
-    if (stop) { restorePhysics(bot); lg(username, '⏹️', 'trick1 stopped'); return; }
+    clearAnim(st, bot);
+    if (stop) { lg(username, '⏹️', 'donut stopped'); return; }
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
-    if (isNaN(cx) || isNaN(cz) || isNaN(radius) || radius <= 0) { lg(username, '❌', 'trick1 <cx> <cz> <radius> [amp] [speed] [in|out|tangent]'); return; }
+    if (isNaN(cx) || isNaN(cz) || isNaN(radius) || radius <= 0) { lg(username, '❌', 'donut <cx> <cz> <radius> [amp] [speed] [in|out|tangent]'); return; }
     var spd = (speed > 0 && !isNaN(speed)) ? speed : 0.05;
-    waveSpeed.t1 = spd;
-    waveActive.t1++;
-    st.anim      = 'trick1';
+    waveSpeed.donut = spd;
+    waveActive.donut++;
+    st.anim      = 'donut';
     st.cx = cx; st.cz = cz; st.radius = radius; st.speed = spd;
     st.amp       = (amplitude > 0 && !isNaN(amplitude)) ? amplitude : 3;
     st.angle     = (phaseOffset !== undefined && !isNaN(phaseOffset)) ? phaseOffset : Math.atan2(bot.entity.position.z - cz, bot.entity.position.x - cx);
@@ -978,23 +1243,21 @@ function startModeB(botCount, getUsername) {
     st.faceIn    = facing === 'in';
     st.faceOut   = facing === 'out';
     freezePhysics(bot);
-    lg(username, '🌊', 'trick1 r=' + radius + ' amp=' + st.amp + ' face=' + (facing || 'tangent'));
+    lg(username, '🌊', 'donut r=' + radius + ' amp=' + st.amp + ' face=' + (facing || 'tangent'));
   }
 
 
-  function doTrick2(bot, username, index, stop, cx, cz, radius, amplitude, speed, phaseOffset, facing) {
+  function doAirjump(bot, username, index, stop, cx, cz, radius, amplitude, speed, phaseOffset, facing) {
     var st = botState[index];
-    if (st.anim === 'trick2') { waveActive.t2 = Math.max(0, waveActive.t2 - 1); }
-    if (st.anim === 'trick1') { waveActive.t1 = Math.max(0, waveActive.t1 - 1); }
-    st.anim = null;
-    if (stop) { restorePhysics(bot); lg(username, '⏹️', 'trick2 stopped'); return; }
+    clearAnim(st, bot);
+    if (stop) { lg(username, '⏹️', 'airjump stopped'); return; }
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
-    if (isNaN(cx) || isNaN(cz) || isNaN(radius) || radius <= 0) { lg(username, '❌', 'trick2 <cx> <cz> <radius> [amp] [speed] [in|out|tangent]'); return; }
+    if (isNaN(cx) || isNaN(cz) || isNaN(radius) || radius <= 0) { lg(username, '❌', 'airjump <cx> <cz> <radius> [amp] [speed] [in|out|tangent]'); return; }
     var spd      = (speed > 0 && !isNaN(speed)) ? speed : 0.05;
     var ringAngle = (phaseOffset !== undefined && !isNaN(phaseOffset)) ? phaseOffset : Math.atan2(bot.entity.position.z - cz, bot.entity.position.x - cx);
-    waveSpeed.t2 = spd;
-    waveActive.t2++;
-    st.anim      = 'trick2';
+    waveSpeed.airjump = spd;
+    waveActive.airjump++;
+    st.anim      = 'airjump';
     st.cx = cx; st.cz = cz;
     st.amp       = (amplitude > 0 && !isNaN(amplitude)) ? amplitude : 3;
     st.ringAngle = ringAngle;
@@ -1006,15 +1269,14 @@ function startModeB(botCount, getUsername) {
            : facing === 'out' ? Math.atan2(st.tz - cz, st.tx - cx)
            :                    -(ringAngle + 1.5707963);
     freezePhysics(bot);
-    lg(username, '👋', 'trick2 r=' + radius + ' amp=' + st.amp + ' face=' + (facing || 'tangent'));
+    lg(username, '👋', 'airjump r=' + radius + ' amp=' + st.amp + ' face=' + (facing || 'tangent'));
   }
 
 
   function doWjump(bot, username, index, stop, cx, cz, radius, jumpHeight, speed, phaseOffset, facing) {
     var st = botState[index];
-    if (st.anim === 'wjump') { waveActive.wj = Math.max(0, waveActive.wj - 1); }
-    st.anim = null;
-    if (stop) { restorePhysics(bot); lg(username, '⏹️', 'wjump stopped'); return; }
+    clearAnim(st, bot);
+    if (stop) { lg(username, '⏹️', 'wjump stopped'); return; }
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
     if (isNaN(cx) || isNaN(cz) || isNaN(radius) || radius <= 0) { lg(username, '❌', 'wjump <cx> <cz> <radius> [height] [speed] [in|out|tangent]'); return; }
     var spd       = (speed > 0 && !isNaN(speed)) ? speed : 0.08;
@@ -1039,8 +1301,8 @@ function startModeB(botCount, getUsername) {
 
   function doStar(bot, username, index, stop, cx, cz, outerR, innerR, speed, phaseOffset, facing) {
     var st = botState[index];
-    st.anim = null;
-    if (stop) { restorePhysics(bot); lg(username, '⏹️', 'star stopped'); return; }
+    if (stop) { clearAnim(st, bot); lg(username, '⏹️', 'star stopped'); return; }
+    clearAnim(st, bot);
     if (!bot || !bot.entity) { lg(username, '❌', 'Not spawned'); return; }
     if (isNaN(cx) || isNaN(cz) || isNaN(outerR) || outerR <= 0) { lg(username, '❌', 'star <cx> <cz> <outerR> [innerR] [speed] [in|out|tangent]'); return; }
     var iR  = (innerR > 0 && !isNaN(innerR)) ? innerR : outerR * 0.4;
@@ -1176,7 +1438,7 @@ function startModeB(botCount, getUsername) {
   function execCmd(bot, username, index, cmd, args) {
     if (!bot) { console.log('[' + username + '] not connected'); return; }
 
-    // ── Movement commands (forward / back / left / right / jump / sneak / sprint) ──
+    // ── Movement commands (front / back / left / right / jump / sneak / sprint) ──
     // With a number arg: walk that many blocks, then stop.
     // Without a number arg: toggle the key on/off.
     if (MOVE_KEYS.indexOf(cmd) !== -1) {
@@ -1195,10 +1457,7 @@ function startModeB(botCount, getUsername) {
       stopAll(bot);
       var _st = botState[index];
       if (_st.shiftTimer) { clearTimeout(_st.shiftTimer); _st.shiftTimer = null; }
-      if (_st.anim === 'trick1') waveActive.t1 = Math.max(0, waveActive.t1 - 1);
-      if (_st.anim === 'trick2') waveActive.t2 = Math.max(0, waveActive.t2 - 1);
-      if (_st.anim === 'wjump')  waveActive.wj = Math.max(0, waveActive.wj  - 1);
-      _st.anim    = null;
+      clearAnim(_st, bot);
       _st.pTick   = 0;
       _st.farmTick= 0;
       _st.farming = false;
@@ -1206,7 +1465,6 @@ function startModeB(botCount, getUsername) {
       _st.follow.active = false;
       _st.snake.active = false;
       removeForbitGroup(index);
-      restorePhysics(bot);
       lg(username, '⏹️', 'stopped');
       return;
     }
@@ -1231,14 +1489,13 @@ function startModeB(botCount, getUsername) {
     // ── gui — interact with open container windows ──
     if (cmd === 'gui') {
 
-      // gui click <slot> — left-click a slot in the current open window
-      if (args[0] === 'click') {
-        var gslot = parseInt(args[1], 10);
-        if (isNaN(gslot)) { lg(username, '❌', 'gui click <slot>'); return; }
+      // gui <slot> — left-click a slot in the current open window
+      if (args[0] && !isNaN(parseInt(args[0], 10)) && ['open','list','close'].indexOf(args[0]) === -1) {
+        var gslot = parseInt(args[0], 10);
         var win = bot.currentWindow;
         if (!win) { lg(username, '❌', 'no open window'); return; }
         try {
-          win.requiresConfirmation = false; // Bypass confirmation on some servers
+          win.requiresConfirmation = false;
           bot.clickWindow(gslot, 0, 0);
           lg(username, '🪟', 'clicked slot ' + gslot);
         } catch(e) { lg(username, '❌', 'gui: ' + e.message); }
@@ -1288,11 +1545,12 @@ function startModeB(botCount, getUsername) {
       return;
     }
 
+    // ── hub / spawn — send as chat commands (common server shortcuts) ──
+    if (cmd === 'hub') { try { bot.chat('/hub'); lg(username, '🏠', '/hub'); } catch(e) {} return; }
+    if (cmd === 'spawn') { try { bot.chat('/spawn'); lg(username, '🏠', '/spawn'); } catch(e) {} return; }
+
     // ── bw — start BedWars auto-join sequence ──
     if (cmd === 'bw' || /^bw[1-4]$/.test(cmd)) { bwJoin(index); return; }
-
-    // ── rotate — toggle continuous yaw spin (or stop) ──
-    if (cmd === 'rotate') { startRotate(bot, username, index, args[0] === 'stop' || botState[index].anim === 'rotate'); return; }
 
     // ── spin [speed] — continuous yaw spin with custom speed ──
     if (cmd === 'spin') { doSpin(bot, username, index, args[0] === 'stop', parseFloat(args[0])); return; }
@@ -1320,10 +1578,9 @@ function startModeB(botCount, getUsername) {
       return;
     }
 
-    // ── gravity — toggle antigravity using physicsEnabled ──
-    if (cmd === 'gravity') {
-      var gState = args[0] === 'on' ? true : args[0] === 'off' ? false : undefined;
-      doGravity(bot, username, gState);
+    // ── phy — toggle physics on/off ──
+    if (cmd === 'phy') {
+      doPhy(bot, username, args[0] || undefined);
       return;
     }
 
@@ -1333,25 +1590,25 @@ function startModeB(botCount, getUsername) {
       return;
     }
 
-    // ── trick1 — orbiting bots with time-based travelling wave ──
-    // !trick1 <cx> <cz> <radius> [amp] [speed] [in|out|tangent]
-    if (cmd === 'trick1') {
-      var t1stop   = args[0] === 'stop';
-      var t1facing = ['in','out','tangent'].indexOf(args[5]) !== -1 ? args[5] : undefined;
-      doTrick1(bot, username, index, t1stop,
+    // ── donut — orbiting bots with time-based travelling wave ──
+    // !donut <cx> <cz> <radius> [amp] [speed] [in|out|tangent]
+    if (cmd === 'donut') {
+      var dstop   = args[0] === 'stop';
+      var dfacing = ['in','out','tangent'].indexOf(args[5]) !== -1 ? args[5] : undefined;
+      doDonut(bot, username, index, dstop,
         parseFloat(args[0]), parseFloat(args[1]), parseFloat(args[2]),
-        parseFloat(args[3]), parseFloat(args[4]), undefined, t1facing);
+        parseFloat(args[3]), parseFloat(args[4]), undefined, dfacing);
       return;
     }
 
-    // ── trick2 — arm-wave: bots fixed on ring, bump travels around ──
-    // !trick2 <cx> <cz> <radius> [amp] [speed] [in|out|tangent]
-    if (cmd === 'trick2') {
-      var t2stop   = args[0] === 'stop';
-      var t2facing = ['in','out','tangent'].indexOf(args[5]) !== -1 ? args[5] : undefined;
-      doTrick2(bot, username, index, t2stop,
+    // ── airjump — arm-wave: bots fixed on ring, bump travels around ──
+    // !airjump <cx> <cz> <radius> [amp] [speed] [in|out|tangent]
+    if (cmd === 'airjump') {
+      var ajstop   = args[0] === 'stop';
+      var ajfacing = ['in','out','tangent'].indexOf(args[5]) !== -1 ? args[5] : undefined;
+      doAirjump(bot, username, index, ajstop,
         parseFloat(args[0]), parseFloat(args[1]), parseFloat(args[2]),
-        parseFloat(args[3]), parseFloat(args[4]), undefined, t2facing);
+        parseFloat(args[3]), parseFloat(args[4]), undefined, ajfacing);
       return;
     }
 
@@ -1433,6 +1690,30 @@ function startModeB(botCount, getUsername) {
       return;
     }
 
+    // ── !add / !remove fatih <user> — manage authorized in-game issuers ──
+    if (cmd === 'add' && args[0] === 'fatih' && args[1]) {
+      var addUser = args[1].replace(/[<>]/g, '').toLowerCase();
+      if (fatihs[addUser]) { lg(username, 'ℹ️', 'fatih already exists'); return; }
+      fatihs[addUser] = true;
+      lg(username, '✅', 'fatih +' + addUser);
+      return;
+    }
+    if (cmd === 'remove' && args[0] === 'fatih' && args[1]) {
+      var rmUser = args[1].replace(/[<>]/g, '').toLowerCase();
+      if (rmUser === 'whitehawk' || rmUser === 'maxver') { lg(username, '❌', 'cannot remove default fatih'); return; }
+      delete fatihs[rmUser];
+      lg(username, '✅', 'fatih -' + rmUser);
+      return;
+    }
+
+    // ── !list fatih — list all fatihs in party chat ──
+    if (cmd === 'list' && args[0] === 'fatih') {
+      var list = Object.keys(fatihs);
+      try { bot.chat('/pc Fatihs: ' + list.join(', ')); } catch(e) {}
+      lg(username, '📋', 'fatihs: ' + list.join(', '));
+      return;
+    }
+
     // ── !chat — toggle player chat logging ──
     if (cmd === 'chat') {
       bot._chatLogging = !bot._chatLogging;
@@ -1440,8 +1721,8 @@ function startModeB(botCount, getUsername) {
       return;
     }
 
-    // ── !all — list players from tab list ──
-    if (cmd === 'all') {
+    // ── !tab — list players from tab list ──
+    if (cmd === 'tab') {
       if (!bot.entity) { lg(username, '❌', 'Not spawned'); return; }
       var names = Object.keys(bot.players);
       lg(username, '👥', names.length + ' players: ' + names.join(', '));
@@ -1494,17 +1775,21 @@ function startModeB(botCount, getUsername) {
   //  !bot <N> <cmd>     → runs <cmd> on bot number N only
   //  !log               → toggles console output on/off
 
-  console.log('\nReady. Text = chat to all | !cmd [args] | !bot <N> cmd [args]');
+  function getFacing(a) {
+    for (var fi = a.length - 1; fi >= 0; fi--) {
+      if (a[fi] === 'in' || a[fi] === 'out' || a[fi] === 'tangent') return a[fi];
+    }
+    return undefined;
+  }
 
-  rl.on('line', function(rawLine) {
-    var input = rawLine.trim();
+  function processInput(input, silent) {
     if (!input) return;
 
     // No prefix → broadcast as chat to all bots
     if (input[0] !== '!') {
       var sent = 0;
       bots.forEach(function(bot) { try { bot.chat(input); sent++; } catch(_) {} });
-      console.log('>> chat: ' + sent + ' bots');
+      if (!silent) console.log('>> chat: ' + sent + ' bots');
       return;
     }
 
@@ -1519,7 +1804,7 @@ function startModeB(botCount, getUsername) {
     // !log — toggle console output
     if (tokens[0] === 'log') {
       loggingOn = !loggingOn;
-      console.log('>> logging ' + (loggingOn ? 'ON' : 'OFF'));
+      if (!silent) console.log('>> logging ' + (loggingOn ? 'ON' : 'OFF'));
       return;
     }
 
@@ -1530,7 +1815,7 @@ function startModeB(botCount, getUsername) {
     if (tokens[0] === 'bot' && tokens[1] && !isNaN(parseInt(tokens[1], 10))) {
       var idx = parseInt(tokens[1], 10) - 1;
       if (idx < 0 || idx >= botCount || !botList[idx]) {
-        console.log('Bot ' + (idx + 1) + ' not online');
+        if (!silent) console.log('Bot ' + (idx + 1) + ' not online');
         return;
       }
       targets = [{ bot: botList[idx], username: getUsername(idx), index: idx }];
@@ -1546,24 +1831,13 @@ function startModeB(botCount, getUsername) {
     }
 
     if (!cmd) return;
-    if (targets.length > 1) console.log('>> !' + cmd + (args.length ? ' ' + args.join(' ') : '') + ' [' + targets.length + ' bots]');
+    if (targets.length > 1 && !silent) console.log('>> !' + cmd + (args.length ? ' ' + args.join(' ') : '') + ' [' + targets.length + ' bots]');
 
     // ── Coordinated multi-bot dispatchers ───────────────────────────────────────
-    // For commands that need evenly-spaced phase offsets, we intercept here
-    // before the generic execCmd loop and inject the phase into each bot call.
-    // A helper extracts the facing arg (last arg if it's in/out/tangent).
-    function getFacing(a, defaultIdx) {
-      for (var fi = a.length - 1; fi >= 0; fi--) {
-        if (a[fi] === 'in' || a[fi] === 'out' || a[fi] === 'tangent') return a[fi];
-      }
-      return undefined;
-    }
-
     if (targets.length > 1) {
       var n    = targets.length;
       var face = getFacing(args);
 
-      // orbit
       if (cmd === 'orbit' && args[0] !== 'stop') {
         var oCx = parseFloat(args[0]), oCz = parseFloat(args[1]);
         var oR  = parseFloat(args[2]), oSpd = parseFloat(args[3]);
@@ -1575,31 +1849,28 @@ function startModeB(botCount, getUsername) {
         return;
       }
 
-      // trick1
-      if (cmd === 'trick1' && args[0] !== 'stop') {
-        var t1Cx = parseFloat(args[0]), t1Cz = parseFloat(args[1]);
-        var t1R  = parseFloat(args[2]), t1Amp = parseFloat(args[3]), t1Spd = parseFloat(args[4]);
+      if (cmd === 'donut' && args[0] !== 'stop') {
+        var dCx = parseFloat(args[0]), dCz = parseFloat(args[1]);
+        var dR  = parseFloat(args[2]), dAmp = parseFloat(args[3]), dSpd = parseFloat(args[4]);
         for (var ti = 0; ti < n; ti++) {
           (function(entry, ph) {
-            doTrick1(entry.bot, entry.username, entry.index, false, t1Cx, t1Cz, t1R, t1Amp, t1Spd, ph, face);
+            doDonut(entry.bot, entry.username, entry.index, false, dCx, dCz, dR, dAmp, dSpd, ph, face);
           })(targets[ti], (2 * Math.PI * ti) / n);
         }
         return;
       }
 
-      // trick2 — bots get fixed ring positions, wave travels via global clock
-      if (cmd === 'trick2' && args[0] !== 'stop') {
-        var t2Cx = parseFloat(args[0]), t2Cz = parseFloat(args[1]);
-        var t2R  = parseFloat(args[2]), t2Amp = parseFloat(args[3]), t2Spd = parseFloat(args[4]);
-        for (var t2i = 0; t2i < n; t2i++) {
+      if (cmd === 'airjump' && args[0] !== 'stop') {
+        var ajCx = parseFloat(args[0]), ajCz = parseFloat(args[1]);
+        var ajR  = parseFloat(args[2]), ajAmp = parseFloat(args[3]), ajSpd = parseFloat(args[4]);
+        for (var aji = 0; aji < n; aji++) {
           (function(entry, ph) {
-            doTrick2(entry.bot, entry.username, entry.index, false, t2Cx, t2Cz, t2R, t2Amp, t2Spd, ph, face);
-          })(targets[t2i], (2 * Math.PI * t2i) / n);
+            doAirjump(entry.bot, entry.username, entry.index, false, ajCx, ajCz, ajR, ajAmp, ajSpd, ph, face);
+          })(targets[aji], (2 * Math.PI * aji) / n);
         }
         return;
       }
 
-      // wjump — same fixed-ring approach, jump wave travels
       if (cmd === 'wjump' && args[0] !== 'stop') {
         var wjCx = parseFloat(args[0]), wjCz = parseFloat(args[1]);
         var wjR  = parseFloat(args[2]), wjH = parseFloat(args[3]), wjSpd = parseFloat(args[4]);
@@ -1611,7 +1882,6 @@ function startModeB(botCount, getUsername) {
         return;
       }
 
-      // star — bots spread evenly around the star path
       if (cmd === 'star' && args[0] !== 'stop') {
         var stCx = parseFloat(args[0]), stCz = parseFloat(args[1]);
         var stOR = parseFloat(args[2]), stIR = parseFloat(args[3]), stSpd = parseFloat(args[4]);
@@ -1623,7 +1893,6 @@ function startModeB(botCount, getUsername) {
         return;
       }
 
-      // forbit — orbit a player, bots spread evenly around the ring
       if (cmd === 'forbit' && args[0] !== 'stop') {
         var fbUser = args[0];
         var fbRad  = parseFloat(args[1]), fbSpd = parseFloat(args[2]);
@@ -1635,273 +1904,18 @@ function startModeB(botCount, getUsername) {
         return;
       }
     }
-    // ─────────────────────────────────────────────────────────────────────────
 
-    // BW join commands are staggered 1s apart to avoid chat floods
     var isBW = cmd === 'bw' || /^bw[1-4]$/.test(cmd);
     for (var t = 0; t < targets.length; t++) {
       (function(entry, delay) {
         setTimeout(function() { execCmd(entry.bot, entry.username, entry.index, cmd, args); }, delay);
       })(targets[t], isBW ? t * 1000 : 0);
     }
+  }
+
+  console.log('\nReady. Text = chat to all | !cmd [args] | !bot <N> cmd [args]');
+
+  rl.on('line', function(rawLine) {
+    processInput(rawLine.trim());
   });
 }
-
-
-// ============================================================
-//
-//  ██████╗ ██████╗ ███╗   ███╗███╗   ███╗ █████╗ ███╗   ██╗██████╗
-// ██╔════╝██╔═══██╗████╗ ████║████╗ ████║██╔══██╗████╗  ██║██╔══██╗
-// ██║     ██║   ██║██╔████╔██║██╔████╔██║███████║██╔██╗ ██║██║  ██║
-// ██║     ██║   ██║██║╚██╔╝██║██║╚██╔╝██║██╔══██║██║╚██╗██║██║  ██║
-// ╚██████╗╚██████╔╝██║ ╚═╝ ██║██║ ╚═╝ ██║██║  ██║██║ ╚████║██████╔╝
-//  ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝
-//
-//  REFERENCE
-//
-// ════════════════════════════════════════════════════════════════════
-//
-//  HOW TO SEND CHAT  (no prefix)
-//  ─────────────────────────────
-//  hello world       →  all bots send "hello world" in chat
-//
-//
-//  HOW TO TARGET A SINGLE BOT
-//  ──────────────────────────
-//  !bot <N> <cmd>    →  run <cmd> on bot number N only
-//  Example: !bot 3 forward 10
-//
-//
-//  MOVEMENT COMMANDS  (all bots unless prefixed with !bot N)
-//  ─────────────────────────────────────────────────────────
-//  !forward [blocks]    Hold W, or walk N blocks then stop
-//  !back    [blocks]    Hold S, or walk N blocks then stop
-//  !left    [blocks]    Hold A, or strafe N blocks then stop
-//  !right   [blocks]    Hold D, or strafe N blocks then stop
-//  !jump                Toggle jump key
-//  !sprint              Toggle sprint key
-//  !sneak               Toggle sneak key
-//  !stop                Release all keys & cancel all timers
-//
-//
-//  ITEM / INVENTORY COMMANDS
-//  ─────────────────────────
-//  !slot <1-9>          Switch hotbar slot (1 = leftmost)
-//  !click left          Left-click / swing arm (once)
-//  !click right         Right-click / activate held item (once)
-//  !lc                  Toggle left-click spam (~20 punches/sec, every tick)
-//  !lc stop             Stop left-click spam
-//
-//
-//  CONTAINER (GUI) COMMANDS
-//  ────────────────────────
-//  !gui open            Open the nearest container block
-//  !gui list            List items in the open window
-//  !gui click <slot>    Click slot number in open window
-//  !gui close           Close the current window
-//
-//
-//  ROTATION COMMAND
-//  ────────────────
-//  !rotate              Toggle smooth continuous head spin
-//  !rotate stop         Stop spinning
-//
-//
-//  SPIN COMMAND
-//  ────────────
-//  !spin [speed]        Continuous yaw spin at custom speed
-//  !spin stop           Stop spinning
-//
-//
-//  SNAKE COMMAND (physics-free chain follow)
-//  ──────────────────────────────────────────
-//  !snake <user> <dist> [speed]
-//  !snake stop
-//
-//  Bot 0 follows the target player at exactly <dist> blocks (offset-position).
-//  Bot 1 follows bot 0, bot 2 follows bot 1, etc. — forms a straight chain.
-//  Uses freezePhysics (direct position writes), no walking.
-//  Like !follow but chained.
-//
-//
-//  SNEAK / SHIFT COMMAND
-//  ─────────────────────
-//  !shift               Toggle sneak (hold indefinitely)
-//  !shift <seconds>     Hold sneak for N seconds, then release
-//
-//
-//  PARTY COMMAND
-//  ─────────────
-//  !p                   Toggle /p accept spam (every 2 seconds)
-//  !p stop              Stop /p accept spam
-//
-//
-//  FARM COMMAND
-//  ────────────
-//  !farm                Start farm loop:
-//                         waits until bot holds a wooden sword,
-//                         then spams /bw every 3s until sword is gone
-//  !farm stop           Stop the farm loop
-//
-//
-//  ORBIT COMMAND
-//  ─────────────
-//  !orbit <cx> <cz> <radius> [speed] [facing]
-//  !orbit stop
-//
-//  facing = tangent (default) | in (face centre) | out (face away)
-//  Multi-bot: bots auto-spread evenly around the ring.
-//
-//  Examples:
-//    !orbit 100 200 5            — ring at r=5, all bots face tangent
-//    !orbit 0 0 10 0.02 in       — slow orbit, all face centre
-//    !bot 3 orbit 50 50 3 out    — bot #3 solo, faces outward
-//
-//
-//  GRAVITY COMMAND
-//  ───────────────
-//  !gravity             Toggle antigravity on/off (uses physicsEnabled)
-//  !gravity on          Enable antigravity explicitly
-//  !gravity off         Disable antigravity, restore normal fall
-//  Note: !stop also restores physics.
-//
-//
-//  FLY COMMAND
-//  ───────────
-//  !fly up <blocks> [speed]    Rise N blocks smoothly (blk/tick, default 0.1)
-//  !fly down <blocks> [speed]  Sink N blocks smoothly
-//  !fly stop                   Cancel an in-progress fly move
-//  Examples:
-//    !fly up 10          — rise 10 blocks (~2 blk/s)
-//    !fly up 5 0.3       — rise 5 blocks faster (~6 blk/s)
-//    !fly down 3 0.05    — sink 3 blocks very slowly
-//
-//
-//  TRICK1 — ORBITING BOTS WITH TRAVELLING SINE WAVE
-//  ──────────────────────────────────────────────────
-//  !trick1 <cx> <cz> <radius> [amp] [speed] [facing]
-//  !trick1 stop
-//
-//  Bots ORBIT the ring while each bot's Y is driven by a shared global
-//  clock offset by its phase — the wave rolls around the orbiting ring.
-//  Think: floating helix / corkscrew formation.
-//
-//  Examples:
-//    !trick1 0 0 8 3 0.05 in     — orbiting wave, all face centre
-//    !trick1 0 0 10 5 0.04       — bigger amp, slower
-//
-//
-//  TRICK2 — ARM WAVE (bots fixed on ring, bump travels around)
-//  ────────────────────────────────────────────────────────────
-//  !trick2 <cx> <cz> <radius> [amp] [speed] [facing]
-//  !trick2 stop
-//
-//  Bots stay at their FIXED ring positions — they do NOT orbit.
-//  A single "bump" in Y travels around the ring over time, exactly
-//  like people doing the wave while holding hands in a circle.
-//  This is the proper coordinated arm-wave effect.
-//
-//  Examples:
-//    !trick2 100 200 8           — arm-wave, r=8, amp=3, face tangent
-//    !trick2 0 0 10 5 0.04 in    — bigger wave, all face centre
-//    !trick2 0 0 8 2 0.08        — fast small wave
-//
-//
-//  WAVE JUMP (!wjump)
-//  ──────────────────
-//  !wjump <cx> <cz> <radius> [height] [speed] [facing]
-//  !wjump stop
-//
-//  Bots stand at their fixed ring positions and jump in sequence —
-//  a single jump-bump travels around the ring like a stadium wave.
-//  Works without flight (jump goes up only, no going underground).
-//
-//  Examples:
-//    !wjump 0 0 8              — jump wave, r=8, h=2 blocks
-//    !wjump 0 0 8 3 0.1 in     — higher jump, faster, facing centre
-//
-//
-//  STAR COMMAND
-//  ────────────
-//  !star <cx> <cz> <outerRadius> [innerRadius] [speed] [facing]
-//  !star stop
-//
-//  All bots move along a 5-pointed star path centred on (cx, cz).
-//  Multi-bot: bots spread evenly around the path so the whole star
-//  is always "lit up" with bots at different points simultaneously.
-//
-//  outerRadius  — distance from centre to star tips
-//  innerRadius  — distance from centre to inner notches
-//                 (default = outerRadius × 0.4, classic sharp star)
-//  speed        — path fraction per tick (default 0.001 ≈ full lap in ~50s)
-//  facing       — tangent (default) | in | out
-//
-//  Examples:
-//    !star 0 0 10              — sharp 5-star, r=10, default speed
-//    !star 0 0 10 6 0.002      — rounder star (inner r=6), slower
-//    !star 0 0 8 3 0.001 in    — all bots face centre as they trace the star
-//    !bot 1 star 0 0 10        — only bot #1 traces the star solo
-//
-//
-//  FACING NOTE (applies to orbit, trick1, trick2, wjump, star)
-//  ────────────
-//  tangent  — bot faces its direction of travel (default)
-//  in       — bot always looks toward the centre point
-//  out      — bot always looks away from the centre point
-//
-//
-//  BEDWARS AUTO-JOIN
-//  ─────────────────
-//  !bw                  Start BedWars auto-join:
-//                         loops /hub → /bw until landing in bw-lobby-1
-//                         handles cooldowns and wrong lobbies automatically
-//
-//
-//  LOGGING
-//  ───────
-//  !log                 Toggle console output on/off
-//                       (Discord webhook messages are unaffected)
-//
-//
-// ════════════════════════════════════════════════════════════════════
-//
-//  SETUP INSTRUCTIONS
-//  ──────────────────
-//  1. Install Node.js (v16 or newer): https://nodejs.org
-//
-//  2. Install the required dependency:
-//       npm install mineflayer
-//
-//  3. Open this file and edit the CONFIG section at the top:
-//       SERVER_HOST    →  your server's address
-//       SERVER_PORT    →  your server's port (default 25565)
-//       MC_VERSION     →  e.g. '1.8', '1.16.5', '1.20.1'
-//       BOT_PREFIX     →  prefix for all bot usernames
-//       LOGIN_PASSWORD →  password sent to /login (Mode A only)
-//       BOT_COUNT      →  how many bots to spawn in Mode B
-//       BOT_START      →  starting number for bot username suffixes
-//       WEBHOOKS       →  list of Discord webhook URLs for bot logging
-//
-//  4. Run the script:
-//       node gooner.js
-//
-//  5. Choose a mode when prompted:
-//       a  →  Login cycler (sequentially logs each bot in and out)
-//       b  →  Play controller (spawns all bots using BOT_PREFIX + number)
-//       c  →  Play controller using custom usernames from MODE_C_USERNAMES
-//             Edit the MODE_C_USERNAMES array near the top of the file.
-//             Bot numbers are assigned by order: first name = bot 1, etc.
-//             The full command system (!orbit, !trick2, etc.) works identically.
-//
-//  NOTES
-//  ─────
-//  • All bots run in offline (cracked) mode — no Microsoft/Mojang auth.
-//  • Discord webhooks cycle round-robin if you have fewer webhooks than bots.
-//  • Bots auto-reconnect 10s after disconnecting.
-//  • BW auto-join will retry indefinitely until it reaches bw-lobby-1.
-//
-// ════════════════════════════════════════════════════════════════════
-//
-//  Annotations added by ChatGPT
-//
-// ============================================================

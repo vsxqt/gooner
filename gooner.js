@@ -24,13 +24,13 @@ const https      = require('https');      // For sending Discord webhook message
 const SERVER_HOST = 'as.mineberry.net';   // ← replace with your server address
 const SERVER_PORT = 25565;                // ← replace with your server port
 const MC_VERSION  = '1.8';               // ← Minecraft version string
-const BOT_PREFIX  = 'wbotmark_';    // ← prefix used for all bot usernames
+const BOT_PREFIX  = 'user_prefix_';    // ← change this to match your bot usernames
 
 // ────────────────────────────────────────────────────────────
 //  MODE A CONFIG — login cycler
 // ────────────────────────────────────────────────────────────
 
-const LOGIN_PASSWORD = '12345';   // ← /login password sent after join
+const LOGIN_PASSWORD = 'your_password';   // ← /login password sent after join (Mode A only)
 
 // ────────────────────────────────────────────────────────────
 //  MODE B CONFIG — play controller
@@ -47,9 +47,9 @@ const BOT_START = 1;   // Starting number suffix for bot usernames
 // ────────────────────────────────────────────────────────────
 
 const MODE_C_USERNAMES = [
-  'wbotmark_13',    // ← bot 1
-  'wbotmark_14',    // ← bot 2
-  'wbotmark_15',    // ← bot 3
+  'custom_bot_1',    // ← bot 1 - replace with your own usernames
+  'custom_bot_2',    // ← bot 2
+  'custom_bot_3',    // ← bot 3
   // add as many as you need — no limit
 ];
 // Replace these with your own Discord webhook URLs.
